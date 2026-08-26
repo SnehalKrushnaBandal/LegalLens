@@ -1,6 +1,11 @@
-flask
-flask-cors
+fastapi
+uvicorn
+sqlalchemy
+bcrypt
+PyJWT
+python-multipart
+pillow
+reportlab
 opencv-python
-scikit-learn
 numpy
-pandas
+
