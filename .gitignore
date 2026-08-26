@@ -11,3 +11,5 @@ venv/
 
 uploads/*
 reports/*
+backend/uploads/*
+backend/uploads/output/*
