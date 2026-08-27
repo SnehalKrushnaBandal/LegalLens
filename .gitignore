@@ -13,3 +13,7 @@ uploads/*
 reports/*
 backend/uploads/*
 backend/uploads/output/*
+
+# Local SQLite database
+backend/*.db
+*.db
