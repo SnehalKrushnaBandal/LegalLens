@@ -86,7 +86,7 @@ def download_pdf_report(
             "inspection_number": insp.inspection_number,
             "inspection_date": insp.inspection_date.strftime("%d %B %Y, %I:%M %p"),
             "officer_id": insp.officer.officer_id if insp.officer else "LMO001",
-            "officer_name": insp.officer.full_name if insp.officer else "Inspector Rajesh Sharma",
+            "officer_name": insp.officer.full_name if insp.officer else "Inspector Snehal Bandal",
             "product_name": prod.name if prod else "Packaged Commodity",
             "category": prod.category if prod else "General Goods",
             "manufacturer": prod.manufacturer_name if prod else "Declared on Package",

@@ -305,101 +305,349 @@ class OCRService:
 
         return declarations, evidence_items, evidence_image_path
 
+    # ── EasyOCR reader (lazy singleton so it loads only once) ──────────────────
+    _ocr_reader = None
+    _ocr_ready = False
+
+    @classmethod
+    def _get_ocr_reader(cls):
+        """Lazy-load easyocr reader (English). Returns None if unavailable."""
+        if cls._ocr_ready:
+            return cls._ocr_reader
+        try:
+            import easyocr
+            cls._ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+            cls._ocr_ready = True
+            print("[OCR] EasyOCR reader loaded successfully.")
+        except Exception as e:
+            print(f"[OCR] EasyOCR not available: {e}. Falling back to image analysis.")
+            cls._ocr_reader = None
+            cls._ocr_ready = True
+        return cls._ocr_reader
+
+    @classmethod
+    def _extract_text_from_image(cls, image_path: str) -> List[Tuple[Any, str, float]]:
+        """
+        Extracts text from image using EasyOCR.
+        Returns list of (bbox, text, confidence) tuples.
+        """
+        reader = cls._get_ocr_reader()
+        if reader is None:
+            return []
+        try:
+            results = reader.readtext(image_path, detail=1, paragraph=False)
+            # results: [([[x1,y1],[x2,y1],[x2,y2],[x1,y2]], text, conf), ...]
+            return results
+        except Exception as e:
+            print(f"[OCR] Text extraction error: {e}")
+            return []
+
+    @classmethod
+    def _parse_declarations_from_text(
+        cls,
+        ocr_results: List[Tuple[Any, str, float]],
+        image_width: int,
+        image_height: int,
+        custom_product_name: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Parses raw OCR results into the 9 mandatory Legal Metrology declarations
+        using regex pattern matching on extracted text.
+        """
+        import re
+
+        # Join all text in reading order
+        all_lines = [(r[1].strip(), r[2], r[0]) for r in ocr_results if r[1].strip()]
+        full_text = "\n".join(t for t, _, _ in all_lines)
+        full_text_lower = full_text.lower()
+
+        def find_text_by_pattern(patterns, lines):
+            """Returns (matched_text, confidence, bbox_pct) or (None, 0, None)"""
+            for pattern in patterns:
+                for text, conf, bbox in lines:
+                    if re.search(pattern, text, re.IGNORECASE):
+                        # Convert pixel bbox to percentage
+                        try:
+                            xs = [p[0] for p in bbox]
+                            ys = [p[1] for p in bbox]
+                            x_pct = max(0, min(95, int(min(xs) * 100 / max(image_width, 1))))
+                            y_pct = max(0, min(95, int(min(ys) * 100 / max(image_height, 1))))
+                            w_pct = max(5, min(95 - x_pct, int((max(xs) - min(xs)) * 100 / max(image_width, 1))))
+                            h_pct = max(3, min(95 - y_pct, int((max(ys) - min(ys)) * 100 / max(image_height, 1))))
+                        except:
+                            x_pct, y_pct, w_pct, h_pct = 10, 10, 80, 8
+                        return text, float(conf), {"x": x_pct, "y": y_pct, "w": w_pct, "h": h_pct}
+            return None, 0.0, None
+
+        def find_multiline(keyword_patterns, lines, window=3):
+            """Collect lines that appear near a keyword match."""
+            for ki, kp in enumerate(keyword_patterns):
+                for i, (text, conf, bbox) in enumerate(lines):
+                    if re.search(kp, text, re.IGNORECASE):
+                        nearby = [lines[j][0] for j in range(i, min(i + window, len(lines)))]
+                        combined = " ".join(nearby)
+                        try:
+                            xs = [p[0] for p in bbox]
+                            ys = [p[1] for p in bbox]
+                            x_pct = max(0, int(min(xs) * 100 / max(image_width, 1)))
+                            y_pct = max(0, int(min(ys) * 100 / max(image_height, 1)))
+                            w_pct = max(5, int((max(xs) - min(xs)) * 100 / max(image_width, 1)) + 10)
+                            h_pct = max(5, int((max(ys) - min(ys)) * 100 / max(image_height, 1)) * window)
+                        except:
+                            x_pct, y_pct, w_pct, h_pct = 10, 25, 80, 12
+                        return combined, float(conf), {"x": x_pct, "y": y_pct, "w": w_pct, "h": h_pct}
+            return None, 0.0, None
+
+        declarations = []
+
+        # ── 1. Product Name ──────────────────────────────────────────────────
+        # Heuristic: largest font text at top, or custom name provided
+        pname_val = custom_product_name
+        pname_conf = 0.85
+        pname_box = {"x": 8, "y": 5, "w": 84, "h": 12}
+        if not pname_val and all_lines:
+            # Largest text is usually the product name (first few lines, high conf)
+            top_candidates = [t for t, c, b in all_lines[:8] if len(t) > 3 and c > 0.5]
+            if top_candidates:
+                pname_val = top_candidates[0]
+                pname_conf = all_lines[0][1]
+        if not pname_val:
+            pname_val = None
+
+        declarations.append({
+            "field_name": "product_name",
+            "detected_value": pname_val,
+            "is_present": bool(pname_val),
+            "confidence": round(pname_conf, 2),
+            "estimated_font_size_px": 26.0,
+            "readability_status": "PASS" if pname_val else "WARNING",
+            "raw_bounding_box": {**pname_box, "color": "#10B981" if pname_val else "#EF4444"}
+        })
+
+        # ── 2. Manufacturer / Packer ─────────────────────────────────────────
+        mfr_patterns = [
+            r'(manufactured|packed|mfd|mfg|packaged)\s*(by|&\s*marketed|and\s*marketed)?',
+            r'(manufacturer|packer|importer)\s*:',
+            r'pvt\.?\s*ltd\.?', r'private\s+limited', r'industries?\s+ltd',
+        ]
+        mfr_val, mfr_conf, mfr_box = find_multiline(mfr_patterns, all_lines, window=2)
+        if not mfr_box:
+            mfr_box = {"x": 8, "y": 22, "w": 84, "h": 10}
+
+        declarations.append({
+            "field_name": "manufacturer",
+            "detected_value": mfr_val,
+            "is_present": bool(mfr_val),
+            "confidence": round(mfr_conf, 2) if mfr_val else 0.15,
+            "estimated_font_size_px": 15.0,
+            "readability_status": "PASS" if mfr_val else "WARNING",
+            "raw_bounding_box": {**mfr_box, "color": "#10B981" if mfr_val else "#EF4444"}
+        })
+
+        # ── 3. Address ───────────────────────────────────────────────────────
+        addr_patterns = [
+            r'\b\d{6}\b',                       # 6-digit PIN code
+            r'(plot|survey|sector|phase|industrial|midc|gidc|estate)',
+            r'(road|nagar|lane|street|marg|colony)',
+            r'(mumbai|delhi|bengaluru|hyderabad|pune|chennai|kolkata|gujarat|maharashtra|karnataka)',
+        ]
+        addr_val, addr_conf, addr_box = find_multiline(addr_patterns, all_lines, window=3)
+        # Extra: look for PIN code anywhere
+        pin_match = re.search(r'\b(\d{6})\b', full_text)
+        if pin_match and not addr_val:
+            addr_val = f"Address with PIN {pin_match.group(1)}"
+            addr_conf = 0.70
+        is_complete_addr = bool(addr_val) and (re.search(r'\d{6}', addr_val or '') is not None)
+        if not addr_box:
+            addr_box = {"x": 8, "y": 34, "w": 84, "h": 12}
+
+        declarations.append({
+            "field_name": "address",
+            "detected_value": addr_val,
+            "is_present": bool(addr_val),
+            "confidence": round(addr_conf, 2) if addr_val else 0.15,
+            "estimated_font_size_px": 13.5,
+            "readability_status": "PASS" if is_complete_addr else ("WARNING" if addr_val else "WARNING"),
+            "raw_bounding_box": {**addr_box, "color": "#10B981" if is_complete_addr else ("#F59E0B" if addr_val else "#EF4444")}
+        })
+
+        # ── 4. Net Quantity ──────────────────────────────────────────────────
+        qty_text, qty_conf, qty_box = find_text_by_pattern([
+            r'\b\d+(\.\d+)?\s*(kg|g\b|ml|l\b|litre|liter|gm\b|gms\b|grm)',
+            r'net\s*(wt|weight|qty|quantity|content)',
+            r'\b(net|content)\b.*\d',
+        ], all_lines)
+        if not qty_box:
+            qty_box = {"x": 8, "y": 48, "w": 42, "h": 12}
+        # Check for non-standard units
+        has_nonstandard = bool(re.search(r'\b(gms|grm|grms|kilos|ltr|lts)\b', qty_text or '', re.IGNORECASE))
+
+        declarations.append({
+            "field_name": "net_quantity",
+            "detected_value": qty_text,
+            "is_present": bool(qty_text),
+            "confidence": round(qty_conf, 2) if qty_text else 0.15,
+            "estimated_font_size_px": 20.0,
+            "readability_status": "WARNING" if has_nonstandard else ("PASS" if qty_text else "WARNING"),
+            "raw_bounding_box": {**qty_box, "color": "#F59E0B" if has_nonstandard else ("#10B981" if qty_text else "#EF4444")}
+        })
+
+        # ── 5. MRP ───────────────────────────────────────────────────────────
+        mrp_text, mrp_conf, mrp_box = find_text_by_pattern([
+            r'(mrp|m\.r\.p|max\.?\s*retail\s*price)',
+            r'(rs\.?|₹|inr)\s*\d+',
+            r'\d+\s*\.?\d*\s*(incl|inclusive)',
+        ], all_lines)
+        has_tax_phrase = bool(re.search(r'incl|inclusive|all\s*tax', (mrp_text or '') + full_text_lower))
+        if not mrp_box:
+            mrp_box = {"x": 52, "y": 48, "w": 40, "h": 12}
+
+        declarations.append({
+            "field_name": "mrp",
+            "detected_value": mrp_text,
+            "is_present": bool(mrp_text),
+            "confidence": round(mrp_conf, 2) if mrp_text else 0.15,
+            "estimated_font_size_px": 18.0,
+            "readability_status": "PASS" if (mrp_text and has_tax_phrase) else ("WARNING" if mrp_text else "WARNING"),
+            "raw_bounding_box": {**mrp_box, "color": "#10B981" if (mrp_text and has_tax_phrase) else ("#F59E0B" if mrp_text else "#EF4444")}
+        })
+
+        # ── 6. Packing Date ──────────────────────────────────────────────────
+        date_text, date_conf, date_box = find_text_by_pattern([
+            r'\b(0[1-9]|1[0-2])[/\-\.](20\d{2})\b',    # MM/YYYY
+            r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s\-,]*(20\d{2})\b',
+            r'(mfg|mfd|packed|manufacturing|packing)\s*(date|dt)?',
+            r'\b(best\s*before|use\s*by|expiry)',
+        ], all_lines)
+        # Direct regex on full text for date
+        if not date_text:
+            dm = re.search(r'\b(0[1-9]|1[0-2])[/\-](20\d{2})\b', full_text)
+            if dm:
+                date_text = dm.group(0)
+                date_conf = 0.85
+        if not date_box:
+            date_box = {"x": 8, "y": 62, "w": 42, "h": 10}
+
+        declarations.append({
+            "field_name": "packed_date",
+            "detected_value": date_text,
+            "is_present": bool(date_text),
+            "confidence": round(date_conf, 2) if date_text else 0.15,
+            "estimated_font_size_px": 14.0,
+            "readability_status": "PASS" if date_text else "WARNING",
+            "raw_bounding_box": {**date_box, "color": "#10B981" if date_text else "#EF4444"}
+        })
+
+        # ── 7. Consumer Care ─────────────────────────────────────────────────
+        # Phone
+        phone_match = re.search(r'(1800[\s\-]\d{3}[\s\-]\d{4}|\+?91[\s\-]?\d{10}|\b\d{10}\b)', full_text)
+        # Email
+        email_match = re.search(r'[\w.\-+]+@[\w\-]+\.[a-zA-Z]{2,}', full_text)
+        cc_val = None
+        cc_parts = []
+        if phone_match:
+            cc_parts.append(f"Tel: {phone_match.group(0)}")
+        if email_match:
+            cc_parts.append(f"Email: {email_match.group(0)}")
+        if cc_parts:
+            cc_val = ", ".join(cc_parts)
+        cc_conf_text, cc_conf, cc_box = find_text_by_pattern([
+            r'(consumer\s*care|helpline|toll\s*free|customer\s*care|grievance)',
+            r'(contact\s*us|reach\s*us|support)',
+        ], all_lines)
+        if not cc_box:
+            cc_box = {"x": 52, "y": 62, "w": 40, "h": 16}
+
+        declarations.append({
+            "field_name": "consumer_care",
+            "detected_value": cc_val,
+            "is_present": bool(cc_val),
+            "confidence": 0.92 if cc_val else 0.15,
+            "estimated_font_size_px": 13.0,
+            "readability_status": "PASS" if cc_val else "WARNING",
+            "raw_bounding_box": {**cc_box, "color": "#10B981" if cc_val else "#EF4444"}
+        })
+
+        # ── 8. Country of Origin ─────────────────────────────────────────────
+        origin_text, origin_conf, origin_box = find_text_by_pattern([
+            r'(country\s*of\s*origin|made\s*in|manufactured\s*in|product\s*of)',
+            r'\b(india|bharat|china|usa|germany|bangladesh|sri\s*lanka)\b',
+        ], all_lines)
+        if not origin_text:
+            om = re.search(r'\b(made\s*in|country\s*of\s*origin|manufactured\s*in)\s*:?\s*([A-Za-z\s]+)', full_text, re.IGNORECASE)
+            if om:
+                origin_text = om.group(0).strip()
+                origin_conf = 0.88
+            elif re.search(r'\bindia\b|\bbharat\b', full_text_lower):
+                origin_text = "India"
+                origin_conf = 0.75
+        if not origin_box:
+            origin_box = {"x": 8, "y": 75, "w": 42, "h": 9}
+
+        declarations.append({
+            "field_name": "country_of_origin",
+            "detected_value": origin_text,
+            "is_present": bool(origin_text),
+            "confidence": round(origin_conf, 2) if origin_text else 0.15,
+            "estimated_font_size_px": 14.0,
+            "readability_status": "PASS" if origin_text else "WARNING",
+            "raw_bounding_box": {**origin_box, "color": "#10B981" if origin_text else "#EF4444"}
+        })
+
+        # ── 9. Unit Sale Price ───────────────────────────────────────────────
+        usp_text, usp_conf, usp_box = find_text_by_pattern([
+            r'(unit\s*sale\s*price|usp|price\s*per\s*(g|kg|ml|l|unit|piece|pc))',
+            r'(rs\.?|₹)\s*\d+(\.\d+)?\s*/\s*(g\b|kg|ml|l\b)',
+        ], all_lines)
+        if not usp_box:
+            usp_box = {"x": 8, "y": 86, "w": 84, "h": 9}
+
+        declarations.append({
+            "field_name": "unit_sale_price",
+            "detected_value": usp_text,
+            "is_present": bool(usp_text),
+            "confidence": round(usp_conf, 2) if usp_text else 0.15,
+            "estimated_font_size_px": 13.5,
+            "readability_status": "PASS" if usp_text else "WARNING",
+            "raw_bounding_box": {**usp_box, "color": "#10B981" if usp_text else "#EF4444"}
+        })
+
+        return declarations
+
     @classmethod
     def _process_generic_upload(
-        cls, 
-        image_path: str, 
-        custom_product_name: Optional[str], 
+        cls,
+        image_path: str,
+        custom_product_name: Optional[str],
         category: Optional[str]
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
         """
-        Processes an arbitrary user-uploaded image using intelligent heuristic scanning.
+        Processes a user-uploaded image using real OCR (EasyOCR) + regex field parsing.
+        Extracts actual text from the image and maps it to mandatory Legal Metrology declarations.
         """
-        p_name = custom_product_name or "Scanned Packaged Commodity"
-        
-        declarations = [
-            {
-                "field_name": "product_name",
-                "detected_value": p_name,
-                "is_present": True,
-                "confidence": 0.92,
-                "estimated_font_size_px": 24.0,
-                "readability_status": "PASS",
-                "raw_bounding_box": {"x": 10, "y": 10, "w": 80, "h": 12, "color": "#10B981"}
-            },
-            {
-                "field_name": "manufacturer",
-                "detected_value": "National Consumer Products Private Limited",
-                "is_present": True,
-                "confidence": 0.90,
-                "estimated_font_size_px": 15.0,
-                "readability_status": "PASS",
-                "raw_bounding_box": {"x": 10, "y": 25, "w": 80, "h": 10, "color": "#10B981"}
-            },
-            {
-                "field_name": "address",
-                "detected_value": "Plot 15, Industrial Area Phase II, Gurugram, Haryana 122002",
-                "is_present": True,
-                "confidence": 0.88,
-                "estimated_font_size_px": 13.5,
-                "readability_status": "PASS",
-                "raw_bounding_box": {"x": 10, "y": 37, "w": 80, "h": 12, "color": "#10B981"}
-            },
-            {
-                "field_name": "net_quantity",
-                "detected_value": "500 g",
-                "is_present": True,
-                "confidence": 0.95,
-                "estimated_font_size_px": 20.0,
-                "readability_status": "PASS",
-                "raw_bounding_box": {"x": 10, "y": 51, "w": 38, "h": 12, "color": "#10B981"}
-            },
-            {
-                "field_name": "mrp",
-                "detected_value": "₹150.00 (Incl. of all taxes)",
-                "is_present": True,
-                "confidence": 0.94,
-                "estimated_font_size_px": 18.0,
-                "readability_status": "PASS",
-                "raw_bounding_box": {"x": 52, "y": 51, "w": 38, "h": 12, "color": "#10B981"}
-            },
-            {
-                "field_name": "packed_date",
-                "detected_value": "08/2026",
-                "is_present": True,
-                "confidence": 0.91,
-                "estimated_font_size_px": 14.0,
-                "readability_status": "PASS",
-                "raw_bounding_box": {"x": 10, "y": 65, "w": 38, "h": 10, "color": "#10B981"}
-            },
-            {
-                "field_name": "consumer_care",
-                "detected_value": "Tel: 1800-200-1234, Email: support@consumerproducts.in",
-                "is_present": True,
-                "confidence": 0.93,
-                "estimated_font_size_px": 13.0,
-                "readability_status": "PASS",
-                "raw_bounding_box": {"x": 52, "y": 65, "w": 38, "h": 16, "color": "#10B981"}
-            },
-            {
-                "field_name": "country_of_origin",
-                "detected_value": "India",
-                "is_present": True,
-                "confidence": 0.98,
-                "estimated_font_size_px": 14.0,
-                "readability_status": "PASS",
-                "raw_bounding_box": {"x": 10, "y": 77, "w": 38, "h": 9, "color": "#10B981"}
-            },
-            {
-                "field_name": "unit_sale_price",
-                "detected_value": "₹0.30 / g",
-                "is_present": True,
-                "confidence": 0.90,
-                "estimated_font_size_px": 13.5,
-                "readability_status": "PASS",
-                "raw_bounding_box": {"x": 10, "y": 88, "w": 80, "h": 8, "color": "#10B981"}
-            }
-        ]
+        print(f"[OCR] Processing uploaded image: {image_path}")
+
+        # Get image dimensions for bbox normalisation
+        try:
+            with Image.open(image_path) as img:
+                img_w, img_h = img.size
+        except Exception:
+            img_w, img_h = 800, 600
+
+        # Run EasyOCR on the real uploaded image
+        ocr_results = cls._extract_text_from_image(image_path)
+        print(f"[OCR] Extracted {len(ocr_results)} text regions from uploaded image.")
+
+        # Parse declarations from actual OCR output
+        declarations = cls._parse_declarations_from_text(
+            ocr_results, img_w, img_h, custom_product_name
+        )
+
+        # Log what was found
+        found = [d["field_name"] for d in declarations if d["is_present"]]
+        missing = [d["field_name"] for d in declarations if not d["is_present"]]
+        print(f"[OCR] Found fields: {found}")
+        print(f"[OCR] Missing fields: {missing}")
 
         evidence_items = []
         for dec in declarations:
@@ -407,7 +655,7 @@ class OCRService:
                 "evidence_type": "BOUNDING_BOX",
                 "label": dec["field_name"].replace("_", " ").title(),
                 "bounding_box_json": dec["raw_bounding_box"],
-                "description": f"Zone detected for {dec['field_name']}"
+                "description": f"{'Detected' if dec['is_present'] else 'NOT FOUND'}: {dec['field_name']}"
             })
 
         evidence_image_path = cls._render_annotated_evidence_image(image_path, declarations, "generic")

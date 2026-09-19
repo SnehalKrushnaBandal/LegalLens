@@ -5,9 +5,9 @@ import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+
   resolve: {
     alias: {
       'react-router-dom': path.resolve(__dirname, 'src/lib/router.jsx'),
@@ -15,21 +15,26 @@ export default defineConfig({
       'recharts': path.resolve(__dirname, 'src/lib/charts.jsx')
     }
   },
+
   server: {
     port: 5173,
+
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+
       '/uploads': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+
       '/demo_assets': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+
       '/reports': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,

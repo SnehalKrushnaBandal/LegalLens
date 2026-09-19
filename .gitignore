@@ -3,6 +3,7 @@ dist/
 
 .env
 .env.*
+!.env.example
 
 __pycache__/
 *.pyc
@@ -13,7 +14,30 @@ uploads/*
 reports/*
 backend/uploads/*
 backend/uploads/output/*
+backend/demo_assets/
+reports/
+
+# Logs
+*.log
 
 # Local SQLite database
 backend/*.db
 *.db
+# SQLite database
+*.sqlite
+*.sqlite3
+
+# Python generated files
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+# Temporary images
+backend/temp_img*.jpg

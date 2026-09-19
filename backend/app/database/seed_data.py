@@ -115,7 +115,7 @@ def seed_database(db: Session):
     if not admin_user:
         admin_user = User(
             officer_id="LMO001",
-            full_name="Inspector Rajesh Sharma",
+            full_name="Inspector Snehal Bandal",
             designation="Senior Legal Metrology Officer",
             email="lmo001@legalmetrology.gov.in",
             hashed_password=get_password_hash("admin123"),
